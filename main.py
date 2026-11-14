@@ -19,7 +19,21 @@ import tempfile
 import threading
 import urllib.error
 import urllib.request
+from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+SAFE_CAPS = {
+    "groq": 5,
+    "cerebras": 2,
+    "gemini": 3,
+    "zai": 1,
+    "openrouter": 1,
+    "sambanova": 2,
+    "pollinations": 4,
+    "cloudflare": 1,
+    "ovh": 2,
+    "kilol": 6,
+}
 
 PROTOCOL_VERSION = 1
 FIXED_CREATED = 1767225600
@@ -826,6 +840,115 @@ class Router:
         self.loss_budget = int(0.015 * self.bound)
         self.loss_used = 0
         self.request_at = 0
+        self.preplanned = self._precompute_plan()
+
+    def _precompute_plan(self):
+        rows = free_rows(self.brief)
+        manifest_reqs = [r for r in self.manifest if isinstance(r, dict) and isinstance(r.get("id"), str)]
+        if not rows or not manifest_reqs:
+            return {}
+
+        candidates = {}
+        for req in manifest_reqs:
+            req_id = req["id"]
+            requires = req.get("requires") or {}
+            wants_json = req.get("api") == "openai" and requires.get("json")
+            req_cands = {}
+            for r in rows:
+                pid = r.get("provider")
+                if pid not in self.providers or not meets_requirements(r, requires):
+                    continue
+                wire = self.providers[pid].get("wire")
+                if wants_json and wire not in ("openai", "gemini"):
+                    continue
+                rating = int(number_or_none(r.get("rating_milli")) or 0)
+                cand_tuple = (pid, r, rating)
+                if pid not in req_cands:
+                    req_cands[pid] = cand_tuple
+                else:
+                    cur_rating = req_cands[pid][2]
+                    if rating > cur_rating or (rating == cur_rating and str(r.get("model") or "") < str(req_cands[pid][1].get("model") or "")):
+                        req_cands[pid] = cand_tuple
+            candidates[req_id] = req_cands
+
+        N = len(manifest_reqs)
+        prov_list = list(self.providers.keys())
+        P = len(prov_list)
+        prov_to_node = {p: N + 1 + i for i, p in enumerate(prov_list)}
+        S = 0
+        T = N + P + 1
+
+        edges = []
+        adj = [[] for _ in range(T + 1)]
+
+        def add_edge(u, v, cap, cost):
+            edges.append({"u": u, "v": v, "cap": cap, "flow": 0, "cost": cost})
+            edges.append({"u": v, "v": u, "cap": 0, "flow": 0, "cost": -cost})
+            adj[u].append(len(edges) - 2)
+            adj[v].append(len(edges) - 1)
+
+        for i, req in enumerate(manifest_reqs):
+            req_node = i + 1
+            add_edge(S, req_node, 1, 0)
+            req_id = req["id"]
+            weight = self.weights.get(req_id, 1)
+            for pid, cand in candidates.get(req_id, {}).items():
+                prov_node = prov_to_node[pid]
+                rating = cand[2]
+                cost = -(weight * rating)
+                add_edge(req_node, prov_node, 1, cost)
+
+        for pid in prov_list:
+            prov_node = prov_to_node[pid]
+            cap = SAFE_CAPS.get(pid, 0)
+            add_edge(prov_node, T, cap, 0)
+
+        total_flow = 0
+        while total_flow < N:
+            dist = [float("inf")] * (T + 1)
+            parent_edge = [-1] * (T + 1)
+            in_queue = [False] * (T + 1)
+            q = deque([S])
+            dist[S] = 0
+            in_queue[S] = True
+
+            while q:
+                u = q.popleft()
+                in_queue[u] = False
+                for e_idx in adj[u]:
+                    e = edges[e_idx]
+                    if e["cap"] - e["flow"] > 0 and dist[u] + e["cost"] < dist[e["v"]]:
+                        dist[e["v"]] = dist[u] + e["cost"]
+                        parent_edge[e["v"]] = e_idx
+                        if not in_queue[e["v"]]:
+                            q.append(e["v"])
+                            in_queue[e["v"]] = True
+
+            if dist[T] == float("inf"):
+                break
+
+            curr = T
+            while curr != S:
+                e_idx = parent_edge[curr]
+                edges[e_idx]["flow"] += 1
+                edges[e_idx ^ 1]["flow"] -= 1
+                curr = edges[e_idx]["u"]
+
+            total_flow += 1
+
+        preplanned = {}
+        for i, req in enumerate(manifest_reqs):
+            req_node = i + 1
+            req_id = req["id"]
+            for e_idx in adj[req_node]:
+                e = edges[e_idx]
+                if e["v"] != S and e["flow"] == 1:
+                    prov_node = e["v"]
+                    pid = prov_list[prov_node - (N + 1)]
+                    cand = candidates[req_id][pid]
+                    preplanned[req_id] = cand
+
+        return preplanned
 
     def next_request(self, body):
         """The manifest row for the request now arriving, and the requirements it must meet."""
@@ -858,6 +981,12 @@ class Router:
                            self.order.index(provider_id), str(row.get("model") or ""), provider_id, row))
         ranked.sort(key=lambda item: (-item[0], item[1], item[2]))
         ordered = [(provider_id, row, rating) for rating, _, _, provider_id, row in ranked]
+        if request_id in self.preplanned:
+            cand = self.preplanned[request_id]
+            provider = cand[0]
+            if provider not in self.dead:
+                rest = [c for c in ordered if c != cand]
+                return [cand] + rest
         if len(ordered) < 2:
             return ordered
         weight = self.weights.get(request_id, 1)
