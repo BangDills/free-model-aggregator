@@ -23,16 +23,16 @@ from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 SAFE_CAPS = {
-    "groq": 5,
-    "cerebras": 2,
-    "gemini": 3,
-    "zai": 1,
-    "openrouter": 1,
+    "openrouter": 3,
+    "cloudflare": 2,
+    "zai": 2,
     "sambanova": 2,
-    "pollinations": 4,
-    "cloudflare": 1,
+    "gemini": 3,
     "ovh": 2,
-    "kilol": 6,
+    "cerebras": 2,
+    "groq": 4,
+    "pollinations": 0,
+    "kilol": 0,
 }
 
 PROTOCOL_VERSION = 1
@@ -835,9 +835,7 @@ class Router:
             if isinstance(entry, dict) and isinstance(entry.get("id"), str):
                 self.best[entry["id"]] = int(number_or_none(entry.get("rating_milli")) or 0)
         self.bound = sum(self.weights[rid] * self.best[rid] for rid in self.weights if rid in self.best)
-        # The quality column rounds to an integer, so a loss under a couple of per cent of the bound
-        # is free: spend it on first calls, which a provider always answers, instead of on repeats.
-        self.loss_budget = int(0.015 * self.bound)
+        self.loss_budget = 0
         self.loss_used = 0
         self.request_at = 0
         self.preplanned = self._precompute_plan()
@@ -1103,9 +1101,7 @@ class Entry:
         for at in range(len(plan)):
             provider_id, row, rating = plan[at]
             model = row.get("model")
-            # A refusal that is the provider's own schedule, not its budget, costs one call and the
-            # next call to the same provider usually answers: retry it once before falling back.
-            tries = 2 if at == 0 and len(plan) > 1 else 1
+            tries = 1
             for attempt in range(tries):
                 ok, status, answer, message = self.router.call(provider_id, model, api, body)
                 if ok:
