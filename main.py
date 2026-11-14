@@ -15,6 +15,7 @@ providers' answers: no wall clock and no unseeded randomness, so a replay leaves
 import json
 import os
 import sys
+import tempfile
 import threading
 import urllib.error
 import urllib.request
@@ -1119,7 +1120,229 @@ def serve(brief, catalog):
     server.serve_forever()
 
 
+def selftest():
+    checks = []
+
+    def run_check(name, func):
+        try:
+            err = func()
+            if err:
+                sys.stdout.write("selftest %s: FAIL: %s\n" % (name, err))
+                checks.append(False)
+            else:
+                sys.stdout.write("selftest %s: ok\n" % name)
+                checks.append(True)
+        except Exception as ex:
+            sys.stdout.write("selftest %s: FAIL: %s\n" % (name, ex))
+            checks.append(False)
+
+    def check_brief():
+        alpha_p = {
+            "id": "alpha",
+            "name": "Alpha",
+            "wire": "openai",
+            "auth": "bearer",
+            "key_env": "ALPHA_KEY",
+            "key": "k",
+            "path": "/p/alpha",
+        }
+        beta_p = {
+            "id": "beta",
+            "name": "Beta",
+            "wire": "gemini",
+            "auth": "x-goog-api-key",
+            "key_env": "BETA_KEY",
+            "key": "k",
+            "path": "/p/beta",
+        }
+        doc_directory = {
+            "schema": "free-model-aggregator-01/providers/v1",
+            "providers": [alpha_p, beta_p],
+        }
+        doc_ratings = {
+            "schema": "free-model-aggregator-01/ratings/v1",
+            "ratings": [
+                {
+                    "model": "a-1",
+                    "provider": "alpha",
+                    "rating_milli": 1200,
+                    "free": True,
+                    "tools": True,
+                    "json": True,
+                    "context_length": 8192,
+                },
+                {
+                    "model": "b-1",
+                    "provider": "beta",
+                    "rating_milli": 1500,
+                    "free": True,
+                    "tools": True,
+                    "vision": True,
+                    "json": True,
+                    "context_length": 8192,
+                },
+            ],
+            "best": [{"id": "s1", "rating_milli": 1500}],
+        }
+        doc_workload = {
+            "schema": "free-model-aggregator-01/workload/v1",
+            "manifest": [
+                {
+                    "id": "s1",
+                    "api": "openai",
+                    "stream": False,
+                    "weight": 1,
+                    "requires": {"tools": True, "vision": True},
+                },
+            ],
+            "bodies": {},
+        }
+        with tempfile.NamedTemporaryFile("w+", encoding="utf-8", delete=False) as tf:
+            tf_path = tf.name
+            for doc in (doc_directory, doc_ratings, doc_workload):
+                tf.write(json.dumps(doc) + "\n")
+        try:
+            brief = read_brief(tf_path)
+        finally:
+            try:
+                os.unlink(tf_path)
+            except OSError:
+                pass
+
+        if brief.get("error"):
+            return "brief parsed with error: %s" % brief["error"]
+        if not brief.get("directory") or not brief.get("ratings") or not brief.get("workload"):
+            return "one or more documents failed to parse"
+
+        catalog = build_catalog(brief)
+        providers = catalog.get("providers") or []
+        if len(providers) != 2:
+            return "build_catalog should list 2 providers, got %d" % len(providers)
+        p_ids = [p.get("id") for p in providers]
+        if p_ids != ["alpha", "beta"]:
+            return "build_catalog provider ids mismatch: %s" % p_ids
+        for p in providers:
+            if not p.get("models"):
+                return "provider %s has no free models in catalog" % p.get("id")
+
+        models = served_models(catalog)
+        model_ids = [m[1] for m in models]
+        if model_ids != ["a-1", "b-1"]:
+            return "served_models model ids mismatch: %s" % model_ids
+        return None
+
+    def check_upstream():
+        alpha_p = {
+            "id": "alpha",
+            "name": "Alpha",
+            "wire": "openai",
+            "auth": "bearer",
+            "key_env": "ALPHA_KEY",
+            "key": "k",
+            "path": "/p/alpha",
+        }
+        beta_p = {
+            "id": "beta",
+            "name": "Beta",
+            "wire": "gemini",
+            "auth": "x-goog-api-key",
+            "key_env": "BETA_KEY",
+            "key": "k",
+            "path": "/p/beta",
+        }
+
+        # 1. beta provider (openai -> gemini)
+        beta_body = upstream_body(
+            "openai",
+            beta_p,
+            "b-1",
+            {
+                "model": "auto",
+                "messages": [
+                    {"role": "system", "content": "sys"},
+                    {"role": "user", "content": "hi"},
+                ],
+                "max_tokens": 7,
+                "response_format": {"type": "json_object"},
+            },
+        )
+        if "systemInstruction" not in beta_body:
+            return "beta_body missing systemInstruction"
+        if "contents" not in beta_body:
+            return "beta_body missing contents"
+        gen_cfg = beta_body.get("generationConfig")
+        if not isinstance(gen_cfg, dict) or gen_cfg.get("responseMimeType") != "application/json":
+            return "beta_body generationConfig missing responseMimeType application/json"
+
+        # 2. alpha provider (anthropic -> openai)
+        alpha_anth = upstream_body(
+            "anthropic",
+            alpha_p,
+            "a-1",
+            {
+                "model": "auto",
+                "max_tokens": 9,
+                "system": "sys",
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+        )
+        if alpha_anth.get("max_tokens") != 9:
+            return "alpha_anth missing max_tokens 9"
+        msgs = alpha_anth.get("messages") or []
+        has_sys = any(m.get("role") == "system" and "sys" in (m.get("content") or "") for m in msgs)
+        if not has_sys:
+            return "alpha_anth missing system message holding 'sys'"
+        user_msgs = [m for m in msgs if m.get("role") == "user"]
+        if len(user_msgs) != 1:
+            return "alpha_anth expected 1 user message, found %d" % len(user_msgs)
+
+        # 3. alpha provider (openai -> openai)
+        alpha_open = upstream_body(
+            "openai",
+            alpha_p,
+            "a-1",
+            {
+                "model": "auto",
+                "messages": [{"role": "user", "content": "hi"}],
+                "max_tokens": 5,
+            },
+        )
+        if "messages" not in alpha_open:
+            return "alpha_open missing messages"
+        if alpha_open.get("max_tokens") != 5:
+            return "alpha_open missing max_tokens 5"
+        return None
+
+    def check_streams():
+        s_open = openai_stream("a-1", {"text": "ANSWER ECHO{}", "input": 3, "output": 4})
+        if not s_open.rstrip().endswith("data: [DONE]"):
+            return "openai_stream does not end with 'data: [DONE]'"
+        if '"finish_reason": "stop"' not in s_open:
+            return "openai_stream does not carry chunk with finish_reason 'stop'"
+
+        s_anth = anthropic_stream("a-1", {"text": "ANSWER ECHO{}", "input": 3, "output": 4})
+        for event in ("event: message_start", "event: message_delta", "event: message_stop"):
+            if event not in s_anth:
+                return "anthropic_stream missing %s" % event
+        return None
+
+    run_check("brief", check_brief)
+    run_check("upstream", check_upstream)
+    run_check("streams", check_streams)
+
+    if all(checks):
+        sys.stdout.write("selftest: ok\n")
+        sys.stdout.flush()
+        return 0
+    else:
+        sys.stdout.write("selftest: FAILED\n")
+        sys.stdout.flush()
+        return 1
+
+
 def main(argv):
+    if "--selftest" in argv:
+        return selftest()
     brief = read_brief(PROMPT_FILE)
     if brief["error"] is not None:
         log(brief["error"])
